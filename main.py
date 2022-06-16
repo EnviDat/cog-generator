@@ -1,9 +1,12 @@
+"""Process S3-based geotiffs, using rio-cogeo (gdal)."""
+
 import logging
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Union
 
+import rasterio
 from envidat.s3.bucket import Bucket
 from envidat.utils import get_logger, load_dotenv_if_in_debug_mode
 from rio_cogeo.cogeo import cog_translate, cog_validate
@@ -48,22 +51,11 @@ def _translate(
 def process_cog(
     data: Union[str, bytes, Path],
     profile_options: dict = {},
-    copy_valid_cog: bool = False,
-    compression: bool = False,
     dst_path: Union[str, Path] = None,
+    compress: bool = False,
     **options,
 ) -> bool:
     """Convert an in-memory GeoTIFF to COG."""
-
-    # TODO way to validate geotiff and determine number of bands
-    # WebP only support 3-4 band images
-    # I.e. DTM require TIFF (DEFLATE)
-    if compression is True:
-        profile = "webp"
-        options["web_optimized"] = True
-    else:
-        profile = "deflate"
-
     if isinstance(data, (str, Path)):
         src_path = Path(data).resolve()
         if not src_path.is_file():
@@ -71,39 +63,50 @@ def process_cog(
 
     elif isinstance(data, bytes):
         temp_dir = os.getenv("TEMP_DIR", default="/tmp")
+        log.debug(f"Loading data into tempfile in dir: {temp_dir}")
         temp_file = NamedTemporaryFile(dir=temp_dir, delete=False, suffix=".tiff")
         temp_file.write(data)
         src_path = Path(temp_file.name)
 
-    if dst_path is None and compression:
-        dst_path = src_path.with_name(src_path.stem + "_COG_lossy" + src_path.suffix)
-    elif dst_path is None and compression is None:
-        dst_path = src_path.with_name(src_path.stem + "_COG_lossless" + src_path.suffix)
-
-    if copy_valid_cog and cog_validate(src_path):
-        dst_path = src_path
+    log.info("Reading tiff with rasterio")
+    geotiff = rasterio.open(src_path)
+    if compress:
+        # WebP only supports 3-4 band images
+        if geotiff.count >= 3:
+            log.debug("Setting output profile to webp")
+            profile = "webp"
+        else:
+            log.debug("Setting output profile to jpeg")
+            profile = "jpeg"
     else:
-        log.info(
-            "Creating COG with params "
-            f"src_path: {src_path} | dst_path: {dst_path} "
-            f"profile: {profile} | options: {options}"
+        log.debug("Setting output profile to deflate")
+        profile = "deflate"
+
+    if dst_path is None:
+        dst_path = src_path.with_name(
+            src_path.stem + f"_COG_{profile}" + src_path.suffix
         )
-        _translate(
-            src_path,
-            dst_path,
-            profile,
-            profile_options=profile_options,
-            **options,
-        )
-        log.info("Validating generated COG file")
-        cog_validate(dst_path)
+
+    log.info(
+        "Creating COG with params "
+        f"src_path: {src_path} | dst_path: {dst_path} "
+        f"profile: {profile} | options: {options}"
+    )
+    _translate(
+        geotiff,
+        dst_path,
+        profile,
+        profile_options=profile_options,
+        **options,
+    )
+    log.info("Validating generated COG file")
+    cog_validate(dst_path)
 
     return dst_path
 
 
 def main():
-    """Main script logic."""
-
+    """Run main script logic."""
     load_dotenv_if_in_debug_mode(env_file=".env.secret")
     get_logger()
 
@@ -114,9 +117,9 @@ def main():
         # "findelen_20160419/findelen_20160419_photoscan_dsm_CH1903+_LV95_0.1m.tif",
         "findelen_20160419/findelen_20160419_photoscan_oi_CH1903+_LV95_0.1m.tif",
         # "gries_20150926/gries_20150926_photoscan_dsm_CH1903+_LV95_0.1m.tif",
-        # "gries_20150926/gries_20150926_photoscan_oi_CH1903+_LV95_0.1m.tif",
+        "gries_20150926/gries_20150926_photoscan_oi_CH1903+_LV95_0.1m.tif",
         # "stanna_20150928/stanna_20150928_photoscan_dsm_CH1903+_LV95_0.1m.tif",
-        # "stanna_20150928/stanna_20150928_photoscan_oi_CH1903+_LV95_0.1m.tif",
+        "stanna_20150928/stanna_20150928_photoscan_oi_CH1903+_LV95_0.1m.tif",
     ]
     tiffs = [f"{prefix}{tiff_key}" for tiff_key in tiffs]
 
@@ -128,18 +131,23 @@ def main():
 
         # Set destination key in bucket for COG
         src_key = Path(tiff_key)
-        dst_key = src_key.with_name(src_key.stem + "_COG_lossy" + src_key.suffix)
+        dst_key = str(src_key.with_name(src_key.stem + "_COG" + src_key.suffix))
 
         # # Set this env variable in a K8S setup to an emptyDir volume
         temp_dir = os.getenv("TEMP_DIR", default="/tmp")
-        with NamedTemporaryFile(dir=temp_dir, suffix=".tiff") as temp_file:
+        with NamedTemporaryFile(dir=temp_dir, suffix=".tif") as temp_file:
 
             s3_drone_data.download_file(tiff_key, temp_file.name)
-            cog_path = process_cog(temp_file.name, compression=True)
-            s3_drone_data.upload_file(dst_key, cog_path)
-
-            # Cleanup
-            Path(cog_path).unlink(missing_ok=True)
+            cog_path = process_cog(
+                temp_file.name,
+                web_optimized=True,
+                # profile_options={"jpeg"},
+            )
+            try:
+                s3_drone_data.upload_file(dst_key, cog_path)
+            finally:
+                # Cleanup
+                Path(cog_path).unlink(missing_ok=True)
 
     s3_drone_data.set_cors_config(allow_all=True)
 
