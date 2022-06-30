@@ -99,6 +99,7 @@ def process_cog_with_params(
         https://kokoalberti.com/articles/geotiff-compression-optimization-guide/
         """
         profile_options.update({"PREDICTOR": 2})
+        profile_options.update({"RESAMPLING": "BILINEAR"})
 
     elif compress:
         # # WebP only supports 3-4 band images
