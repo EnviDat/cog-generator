@@ -8,9 +8,10 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import NoReturn, Union
 
+import click
 import rasterio
 from envidat.s3.bucket import Bucket
-from envidat.utils import get_logger, load_dotenv_if_in_debug_mode
+from envidat.utils import get_logger
 from rasterio.io import DatasetReader
 from rio_cogeo.cogeo import cog_translate, cog_validate
 from rio_cogeo.profiles import cog_profiles
@@ -85,6 +86,7 @@ def process_cog_with_params(
         geotiff = data
         temp_dir = os.getenv("TEMP_DIR", default="/tmp")
         src_path = Path(f"{temp_dir}/{uuid.uuid4()}.tif")
+
     else:
         log.info("Reading tiff with rasterio")
         geotiff = rasterio.open(src_path)
@@ -153,7 +155,7 @@ def process_cog_with_params(
 
 
 def process_cog_list(
-    tiff_key_list: list,
+    tiff_keys: Union[list, str],
     s3_copy_from: str = None,
     preload: bool = False,
     compress: bool = False,
@@ -162,21 +164,49 @@ def process_cog_list(
     web_optimized: bool = False,
 ) -> NoReturn:
     """
-    Copy file to new bucket (if needed) and process.
+    Process S3 based TIFFs to create a data copy in COG format.
+
+    The S3 bucket to access data from is pulled from the
+        BUCKET_NAME environment variable.
+    The TEMP_DIR environment variable can be specified for writing temporary files.
+        This particularly import in containers, where the default /tmp is in memory.
+        Change to a valid disk based location, for example an emptyDir in /data.
 
     Args:
-        tiff_key_list (list): List of strings containing S3 keys to tiff files.
-        s3_copy_from
-        preload (bool): Set to True to load the COG file into memory before processing.
+        tiff_key (list,str): List of strings containing S3 keys to tiff files.
+            Must be only a relative key from bucket root, without the SWITCH URL.
+            E.g. wsl/uav-datasets...
+        s3_copy_from (str): S3 bucket to replicate data from, prior to processing.
+            Useful if the data is in another source bucket, but you don't want the
+            output to be produced there.
+        preload (bool): Load the COG file into memory before processing.
+            Only use for smaller files < 4-8GB.
+        compress (bool): Use lossy compression for the internal tiling. JPEG or WEBP.
+        is_dem (bool): If the input data is a DEM, DSM, etc.
+        smooth_dem (bool): Set if the output DEM COG has artifacts and requires further
+            smoothing, using cubic resampling.
+        web_optimized (bool): Re-project the data to web mercator for
+            web map consumption. EPSG 3857.
     """
-    s3_drone_data = Bucket("drone-data", is_new=True, is_public=True)
+    bucket_name = os.getenv("BUCKET_NAME", default="drone-data")
+
+    if isinstance(tiff_keys, (str)):
+        log.debug("String input provided, converting to list")
+        tiff_keys = [tiff_keys]
+
+    s3_drone_data = Bucket(bucket_name, is_new=True, is_public=True)
     if s3_copy_from:
+        log.debug("s3_copy_from set, instantiating bucket")
         s3_from = Bucket(bucket_name=s3_copy_from)
 
-    for tiff_key in tiff_key_list:
+    for tiff_key in tiff_keys:
 
         if s3_copy_from:
-            s3_from.transfer(tiff_key, "drone-data", tiff_key)
+            log.info(
+                f"Copying TIFF data from bucket named {s3_copy_from} "
+                f"to bucket named {bucket_name}"
+            )
+            s3_from.transfer(tiff_key, bucket_name, tiff_key)
 
         if preload:
 
@@ -205,8 +235,10 @@ def process_cog_list(
         else:
 
             suffix_safe = urllib.parse.quote(tiff_key, safe="")
+
+            log.debug("Opening rasterio tiff directly from S3")
             with rasterio.open(
-                f"https://drone-data.s3-zh.os.switch.ch/{suffix_safe}"
+                f"https://{bucket_name}.s3-zh.os.switch.ch/{suffix_safe}"
             ) as src_geotiff:
 
                 cog_path, cog_format = process_cog_with_params(
@@ -232,32 +264,73 @@ def process_cog_list(
             Path(cog_path).unlink(missing_ok=True)
 
 
-def main():
-    """Run main script logic."""
-    load_dotenv_if_in_debug_mode(env_file=".env.secret")
+@click.command()
+@click.option("--tiff", "tiff_keys", help="URL to S3 file for processing.")
+@click.option(
+    "--bucket_name", "bucket_name", help="The S3 bucket to read and write from."
+)
+@click.option(
+    "--s3_from",
+    "s3_copy_from",
+    required=False,
+    help="S3 bucket to replicate data from, prior to processing.",
+)
+@click.option(
+    "--preload", required=False, help="Load the COG file into memory before processing."
+)
+@click.option(
+    "--compress", required=False, help="Use lossy compression for the internal tiling."
+)
+@click.option("--is_dem", required=False, help="If the input data is a DEM, DSM, etc.")
+@click.option(
+    "--smooth_dem",
+    required=False,
+    help="Set if the output DEM COG requires further smoothing.",
+)
+@click.option(
+    "--web_optimized", required=False, help="Re-project the data to EPSG:3857."
+)
+def command_line_run(
+    tiff_keys: Union[list, str],
+    bucket_name: str,
+    s3_copy_from: str = None,
+    preload: bool = False,
+    compress: bool = False,
+    is_dem: bool = False,
+    smooth_dem: bool = False,
+    web_optimized: bool = False,
+) -> NoReturn:
+    """
+    Process S3 based TIFF to create a data copy in COG format.
+
+    Current working directory must contain .env.secret file, with AWS credentials:
+
+    \b
+    LOG_LEVEL=INFO
+    TEMP_DIR=/tmp
+    AWS_ENDPOINT=xxx
+    AWS_REGION=xxx
+    AWS_ACCESS_KEY=xxx
+    AWS_SECRET_KEY=xxx
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv(".env.secret")
     get_logger()
 
-    log.info("Starting main COG generator script.")
+    if bucket_name is None:
+        bucket_name = os.getenv("BUCKET_NAME")
 
-    prefix = "wsl/uav-datasets-for-three-alpine-glaciers/"
-    optical_tiffs = [
-        "findelen_20160419/findelen_20160419_photoscan_oi_CH1903+_LV95_0.1m.tif",
-        "gries_20150926/gries_20150926_photoscan_oi_CH1903+_LV95_0.1m.tif",
-        "stanna_20150928/stanna_20150928_photoscan_oi_CH1903+_LV95_0.1m.tif",
-    ]
-    dem_tiffs = [
-        "findelen_20160419/findelen_20160419_photoscan_dsm_CH1903+_LV95_0.1m.tif",
-        "gries_20150926/gries_20150926_photoscan_dsm_CH1903+_LV95_0.1m.tif",
-        "stanna_20150928/stanna_20150928_photoscan_dsm_CH1903+_LV95_0.1m.tif",
-    ]
-    optical_tiffs = [f"{prefix}{tiff_key}" for tiff_key in optical_tiffs]
-    dem_tiffs = [f"{prefix}{tiff_key}" for tiff_key in dem_tiffs]
-
-    process_cog_list(optical_tiffs, s3_copy_from="envicloud", compress=True)
-    process_cog_list(dem_tiffs, s3_copy_from="envicloud", is_dem=True)
-
-    log.info("Finished main COG generator script.")
+    process_cog_list(
+        tiff_keys,
+        s3_copy_from=s3_copy_from,
+        preload=preload,
+        compress=compress,
+        is_dem=is_dem,
+        smooth_dem=smooth_dem,
+        web_optimized=web_optimized,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    command_line_run()
