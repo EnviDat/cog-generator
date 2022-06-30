@@ -64,6 +64,7 @@ def process_cog_with_params(
     },
     compress: bool = False,
     is_dem: bool = False,
+    smooth_dem: bool = False,
     **options,
 ) -> tuple:
     """Set params and send tiff to translate function."""
@@ -94,12 +95,22 @@ def process_cog_with_params(
     if is_dem:
         """
         Don't lossy compress DEMs, use DEFLATE (or artifacts / steps)
-        To improve size savings, use a predictor: GDAL PREDICTOR=2
-        If your data is floating point values, use PREDICTOR=3
         https://kokoalberti.com/articles/geotiff-compression-optimization-guide/
+        GDAL PREDICTOR
+            To improve size savings, use a predictor: PREDICTOR=2
+            If your data is floating point values, use PREDICTOR=3
+        GDAL RESAMPLING
+            Use BILINEAR for DEM, as NEAREST (neighbour)
+                produces grid/herringbone artifacts
+            If artifacts remain, switch to CUBIC for further smoothing
         """
-        profile_options.update({"PREDICTOR": 2})
-        profile_options.update({"RESAMPLING": "BILINEAR"})
+        if all(x == "float32" for x in geotiff.dtypes):
+            profile_options.update({"PREDICTOR": 3})
+        else:
+            profile_options.update({"PREDICTOR": 2})
+        profile_options.update(
+            {"RESAMPLING": "CUBIC"} if smooth_dem else {"RESAMPLING": "BILINEAR"}
+        )
 
     elif compress:
         # # WebP only supports 3-4 band images
@@ -147,6 +158,7 @@ def process_cog_list(
     preload: bool = False,
     compress: bool = False,
     is_dem: bool = False,
+    smooth_dem: bool = False,
     web_optimized: bool = False,
 ) -> NoReturn:
     """
@@ -178,6 +190,7 @@ def process_cog_list(
                     temp_file.name,
                     compress=compress,
                     is_dem=is_dem,
+                    smooth_dem=smooth_dem,
                     web_optimized=web_optimized,
                 )
 
@@ -200,6 +213,7 @@ def process_cog_list(
                     src_geotiff,
                     compress=compress,
                     is_dem=is_dem,
+                    smooth_dem=smooth_dem,
                     web_optimized=web_optimized,
                 )
 
