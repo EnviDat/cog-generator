@@ -28,7 +28,7 @@ dem_tiffs = [
 optical_tiffs = [f"{prefix}{tiff_key}" for tiff_key in optical_tiffs]
 dem_tiffs = [f"{prefix}{tiff_key}" for tiff_key in dem_tiffs]
 
-process_cog_list(optical_tiffs, s3_copy_from="envicloud", compress=True)
-process_cog_list(dem_tiffs, s3_copy_from="envicloud", is_dem=True)
+process_cog_list(optical_tiffs, replicate_from_bucket="envicloud", compress=True)
+process_cog_list(dem_tiffs, replicate_from_bucket="envicloud", is_dem=True)
 
 log.info("Finished main COG generator script.")

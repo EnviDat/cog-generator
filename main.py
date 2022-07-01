@@ -67,7 +67,7 @@ def process_cog_with_params(
     is_dem: bool = False,
     smooth_dem: bool = False,
     **options,
-) -> tuple:
+) -> str:
     """Set params and send tiff to translate function."""
     if isinstance(data, (str, Path)):
         src_path = Path(data).resolve()
@@ -91,7 +91,7 @@ def process_cog_with_params(
         log.info("Reading tiff with rasterio")
         geotiff = rasterio.open(src_path)
 
-    log.debug("Default output profile=deflate")
+    log.debug("Default output profile = deflate")
     profile = "deflate"
 
     if is_dem:
@@ -131,10 +131,10 @@ def process_cog_with_params(
         profile_options.update({"QUALITY": 85})
 
     if dst_path is None:
-        log.debug("Setting output path to write to")
         dst_path = src_path.with_name(
             src_path.stem + f"_COG_{profile}" + src_path.suffix
         )
+        log.debug(f"Set output path to {dst_path}")
 
     log.info(
         "Creating COG with params "
@@ -151,13 +151,14 @@ def process_cog_with_params(
     log.info(f"Validating generated COG file at {dst_path}")
     cog_validate(dst_path)
 
-    return (dst_path, profile)
+    return dst_path
 
 
 def process_cog_list(
     tiff_keys: Union[list, str],
-    s3_copy_from: str = None,
+    replicate_from_bucket: str = None,
     preload: bool = False,
+    overwrite: bool = False,
     compress: bool = False,
     is_dem: bool = False,
     smooth_dem: bool = False,
@@ -176,11 +177,12 @@ def process_cog_list(
         tiff_key (list,str): List of strings containing S3 keys to tiff files.
             Must be only a relative key from bucket root, without the SWITCH URL.
             E.g. wsl/uav-datasets...
-        s3_copy_from (str): S3 bucket to replicate data from, prior to processing.
-            Useful if the data is in another source bucket, but you don't want the
-            output to be produced there.
+        replicate_from_bucket (str): S3 bucket to replicate data from, prior
+            to processing. Useful if the data is in another source bucket,
+            but you don't want the output to be produced there.
         preload (bool): Load the COG file into memory before processing.
             Only use for smaller files < 4-8GB.
+        overwrite (bool): Overwrite destination S3 file, if exists.
         compress (bool): Use lossy compression for the internal tiling. JPEG or WEBP.
         is_dem (bool): If the input data is a DEM, DSM, etc.
         smooth_dem (bool): Set if the output DEM COG has artifacts and requires further
@@ -188,22 +190,38 @@ def process_cog_list(
         web_optimized (bool): Re-project the data to web mercator for
             web map consumption. EPSG 3857.
     """
-    bucket_name = os.getenv("BUCKET_NAME", default="drone-data")
+    bucket_name = os.getenv("BUCKET_NAME", default="cog")
 
     if isinstance(tiff_keys, (str)):
         log.debug("String input provided, converting to list")
         tiff_keys = [tiff_keys]
 
-    s3_drone_data = Bucket(bucket_name, is_new=True, is_public=True)
-    if s3_copy_from:
-        log.debug("s3_copy_from set, instantiating bucket")
-        s3_from = Bucket(bucket_name=s3_copy_from)
+    s3_cog = Bucket(bucket_name, is_new=True, is_public=True)
+    if replicate_from_bucket:
+        log.debug("replicate_from_bucket set, instantiating bucket")
+        s3_from = Bucket(bucket_name=replicate_from_bucket)
+
+    profile = "jpeg" if compress else "deflate"
 
     for tiff_key in tiff_keys:
 
-        if s3_copy_from:
+        # Set destination key in bucket for COG
+        src_key = Path(tiff_key)
+        dst_key = str(
+            src_key.with_name(src_key.stem + f"_COG_{profile}" + src_key.suffix)
+        )
+
+        if not overwrite:
+            if s3_cog.check_file_exists(dst_key):
+                log.info(
+                    f"Key {dst_key} already exists in bucket {bucket_name}. "
+                    "Skipping COG creation..."
+                )
+                continue
+
+        if replicate_from_bucket:
             log.info(
-                f"Copying TIFF data from bucket named {s3_copy_from} "
+                f"Copying TIFF data from bucket named {replicate_from_bucket} "
                 f"to bucket named {bucket_name}"
             )
             s3_from.transfer(tiff_key, bucket_name, tiff_key)
@@ -214,22 +232,14 @@ def process_cog_list(
             temp_dir = os.getenv("TEMP_DIR", default="/tmp")
             with NamedTemporaryFile(dir=temp_dir, suffix=".tif") as temp_file:
 
-                s3_drone_data.download_file(tiff_key, temp_file.name)
+                s3_cog.download_file(tiff_key, temp_file.name)
 
-                cog_path, cog_format = process_cog_with_params(
+                cog_path = process_cog_with_params(
                     temp_file.name,
                     compress=compress,
                     is_dem=is_dem,
                     smooth_dem=smooth_dem,
                     web_optimized=web_optimized,
-                )
-
-                # Set destination key in bucket for COG
-                src_key = Path(tiff_key)
-                dst_key = str(
-                    src_key.with_name(
-                        src_key.stem + f"_COG_{cog_format}" + src_key.suffix
-                    )
                 )
 
         else:
@@ -241,7 +251,7 @@ def process_cog_list(
                 f"https://{bucket_name}.s3-zh.os.switch.ch/{suffix_safe}"
             ) as src_geotiff:
 
-                cog_path, cog_format = process_cog_with_params(
+                cog_path = process_cog_with_params(
                     src_geotiff,
                     compress=compress,
                     is_dem=is_dem,
@@ -249,16 +259,8 @@ def process_cog_list(
                     web_optimized=web_optimized,
                 )
 
-                # Set destination key in bucket for COG
-                src_key = Path(tiff_key)
-                dst_key = str(
-                    src_key.with_name(
-                        src_key.stem + f"_COG_{cog_format}" + src_key.suffix
-                    )
-                )
-
         try:
-            s3_drone_data.upload_file(dst_key, cog_path)
+            s3_cog.upload_file(dst_key, cog_path)
         finally:
             # Cleanup
             Path(cog_path).unlink(missing_ok=True)
@@ -266,12 +268,10 @@ def process_cog_list(
 
 @click.command()
 @click.option("--tiff", "tiff_keys", help="URL to S3 file for processing.")
+@click.option("--bucket", "bucket_name", help="The S3 bucket to read and write from.")
 @click.option(
-    "--bucket_name", "bucket_name", help="The S3 bucket to read and write from."
-)
-@click.option(
-    "--s3_from",
-    "s3_copy_from",
+    "--replicate-from",
+    "replicate_from_bucket",
     required=False,
     help="S3 bucket to replicate data from, prior to processing.",
 )
@@ -279,22 +279,35 @@ def process_cog_list(
     "--preload", required=False, help="Load the COG file into memory before processing."
 )
 @click.option(
+    "--overwrite",
+    "overwrite",
+    required=False,
+    help="Overwrite destination S3 file, if exists.",
+)
+@click.option(
     "--compress", required=False, help="Use lossy compression for the internal tiling."
 )
-@click.option("--is_dem", required=False, help="If the input data is a DEM, DSM, etc.")
 @click.option(
+    "--dem", "is_dem", required=False, help="If the input data is a DEM, DSM, etc."
+)
+@click.option(
+    "--smooth-dem",
     "--smooth_dem",
     required=False,
     help="Set if the output DEM COG requires further smoothing.",
 )
 @click.option(
-    "--web_optimized", required=False, help="Re-project the data to EPSG:3857."
+    "--web-optimise",
+    "web_optimized",
+    required=False,
+    help="Re-project the data to EPSG:3857.",
 )
 def command_line_run(
     tiff_keys: Union[list, str],
     bucket_name: str,
-    s3_copy_from: str = None,
+    replicate_from_bucket: str = None,
     preload: bool = False,
+    overwrite: bool = False,
     compress: bool = False,
     is_dem: bool = False,
     smooth_dem: bool = False,
@@ -323,8 +336,9 @@ def command_line_run(
 
     process_cog_list(
         tiff_keys,
-        s3_copy_from=s3_copy_from,
+        replicate_from_bucket=replicate_from_bucket,
         preload=preload,
+        overwrite=overwrite,
         compress=compress,
         is_dem=is_dem,
         smooth_dem=smooth_dem,
