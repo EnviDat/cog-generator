@@ -6,7 +6,7 @@ authors = [
     {name = "Sam Woodcock", email = "samuel.woodcock@wsl.ch"},
 ]
 dependencies = [
-    "envidat-utils[dotenv]>=0.5.1",
+    "envidat-utils[dotenv]>=1.0.2",
     "rio-cogeo>=3.2.0",
     "rasterio>=1.2.10",
     "click>=8.1.3",
